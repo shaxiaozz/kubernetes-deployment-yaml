@@ -1,0 +1,425 @@
+kind: Secret
+apiVersion: v1
+metadata:
+  name: redis-sentinel-pass
+type: Opaque
+stringData:
+  REDIS_PASSWORD: 47gJu3cgipA7oO9
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  labels:
+    dce.daocloud.io/app: redis-sentinel
+  name: redis-sentinel
+data:
+  init.sh: |-
+    HOSTNAME="$(hostname)"
+    INDEX="${HOSTNAME##*-}"
+    MASTER="$(redis-cli -h redis-sentinel -p 26379 sentinel get-master-addr-by-name mymaster | grep -E '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}')"
+    MASTER_GROUP="mymaster"
+    QUORUM="2"
+    REDIS_CONF=/data/conf/redis.conf
+    REDIS_PORT=6379
+    SENTINEL_CONF=/data/conf/sentinel.conf
+    SENTINEL_PORT=26379
+    SERVICE=redis-sentinel
+    set -eu
+
+    sentinel_update() {
+        echo "Updating sentinel config with master $MASTER"
+        eval MY_SENTINEL_ID="\${SENTINEL_ID_$INDEX}"
+        sed -i "1s/^/sentinel myid $MY_SENTINEL_ID\\n/" "$SENTINEL_CONF"
+        sed -i "2s/^/sentinel monitor $MASTER_GROUP $1 $REDIS_PORT $QUORUM \\n/" "$SENTINEL_CONF"
+        echo "sentinel announce-ip $ANNOUNCE_IP" >> $SENTINEL_CONF
+        echo "sentinel announce-port $SENTINEL_PORT" >> $SENTINEL_CONF
+    }
+
+    redis_update() {
+        echo "Updating redis config"
+        echo "slaveof $1 $REDIS_PORT" >> "$REDIS_CONF"
+        echo "slave-announce-ip $ANNOUNCE_IP" >> $REDIS_CONF
+        echo "slave-announce-port $REDIS_PORT" >> $REDIS_CONF
+    }
+
+    copy_config() {
+        cp /tmp/redis.conf "$REDIS_CONF"
+        cp /tmp/sentinel.conf "$SENTINEL_CONF"
+    }
+
+    setup_defaults() {
+        echo "Setting up defaults"
+        if [ "$INDEX" = "0" ]; then
+            echo "Setting this pod as the default master"
+            redis_update "$ANNOUNCE_IP"
+            sentinel_update "$ANNOUNCE_IP"
+            sed -i "s/^.*slaveof.*//" "$REDIS_CONF"
+        else
+            DEFAULT_MASTER="$(getent hosts "$SERVICE-announce-0" | awk '{ print $1 }')"
+            if [ -z "$DEFAULT_MASTER" ]; then
+                echo "Unable to resolve host"
+                exit 1
+            fi
+            echo "Setting default slave config.."
+            redis_update "$DEFAULT_MASTER"
+            sentinel_update "$DEFAULT_MASTER"
+        fi
+    }
+
+    find_master() {
+        echo "Attempting to find master"
+        if [ "$(redis-cli -h "$MASTER"$AUTH ping)" != "PONG" ]; then
+            echo "Can't ping master, attempting to force failover"
+            if redis-cli -h "$SERVICE" -p "$SENTINEL_PORT" sentinel failover "$MASTER_GROUP" | grep -q 'NOGOODSLAVE' ; then
+                setup_defaults
+                return 0
+            fi
+            sleep 10
+            MASTER="$(redis-cli -h $SERVICE -p $SENTINEL_PORT sentinel get-master-addr-by-name $MASTER_GROUP | grep -E '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}')"
+            if [ "$MASTER" ]; then
+                sentinel_update "$MASTER"
+                redis_update "$MASTER"
+            else
+                echo "Could not failover, exiting..."
+                exit 1
+            fi
+        else
+            echo "Found reachable master, updating config"
+            sentinel_update "$MASTER"
+            redis_update "$MASTER"
+        fi
+    }
+
+    mkdir -p /data/conf/
+
+    echo "Initializing config.."
+    copy_config
+    set -x
+
+    #echo "maxmemory $((MAXMEMORY/1024/1024-128))mb"   >> $REDIS_CONF
+    echo "maxmemory $MAXMEMORY"   >> $REDIS_CONF
+    echo "maxmemory-policy $MAXMEMORY_POLICY"          >> $REDIS_CONF
+
+    # Read password form environment variables.
+    AUTH=""
+    if [ ! -z "$REDIS_PASSWORD" ]
+    then
+        echo "Redis password auth is enabled"
+        echo "Setting auth values"
+        echo "masterauth  \"$REDIS_PASSWORD\"" >> $REDIS_CONF
+        echo "requirepass \"$REDIS_PASSWORD\"" >> $REDIS_CONF
+
+        echo "sentinel auth-pass mymaster \"$REDIS_PASSWORD\"" >> $SENTINEL_CONF
+        AUTH=" -a $REDIS_PASSWORD"
+    fi
+
+    ANNOUNCE_IP=$(getent hosts "$SERVICE-announce-$INDEX" | awk '{ print $1 }')
+
+    echo $ANNOUNCE_IP
+    if [ -z "$ANNOUNCE_IP" ]; then
+        "Could not resolve the announce ip for this pod"
+        exit 1
+    elif [ "$MASTER" ]; then
+        find_master
+    else
+        setup_defaults
+    fi
+
+    # if [ "${AUTH:-}" ]; then
+    #     echo "Setting auth values"
+    #     ESCAPED_AUTH=$(echo "$AUTH" | sed -e 's/[\/&]/\\&/g');
+    #     sed -i "s/replace-default-auth/${ESCAPED_AUTH}/" "$REDIS_CONF" "$SENTINEL_CONF"
+    # fi
+
+    echo "Ready..."
+
+  redis.conf: |
+    dir "/data"
+    port 6379
+    min-slaves-max-lag 5
+    min-slaves-to-write 1
+    rdbchecksum yes
+    rdbcompression yes
+    repl-diskless-sync yes
+    save 900 1
+
+  sentinel.conf: |
+    dir "/data"
+    sentinel down-after-milliseconds mymaster 5000
+    sentinel failover-timeout mymaster 10000
+    sentinel parallel-syncs mymaster 2
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  labels:
+    dce.daocloud.io/app: redis-sentinel
+  name: redis-sentinel-env
+data:
+  TZ: Asia/Shanghai
+  MAXMEMORY_POLICY: volatile-lru
+  MAXMEMORY: 2000mb
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-sentinel
+  labels:
+    dce.daocloud.io/app: redis-sentinel
+spec:
+  clusterIP: None
+  type: ClusterIP
+  ports:
+    - name: redis
+      protocol: TCP
+      port: 6379
+      targetPort: 6379
+    - name: sentinel
+      protocol: TCP
+      port: 26379
+      targetPort: 26379
+  selector:
+    dce.daocloud.io/component: redis-sentinel
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-sentinel-announce-0
+  labels:
+    dce.daocloud.io/app: redis-sentinel
+spec:
+  type: ClusterIP
+  publishNotReadyAddresses: true
+  ports:
+    - name: redis
+      protocol: TCP
+      port: 6379
+      targetPort: 6379
+    - name: sentinel
+      protocol: TCP
+      port: 26379
+      targetPort: 26379
+  selector:
+    statefulset.kubernetes.io/pod-name: redis-sentinel-server-0
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-sentinel-announce-1
+  labels:
+    dce.daocloud.io/app: redis-sentinel
+spec:
+  type: ClusterIP
+  publishNotReadyAddresses: true
+  ports:
+    - name: redis
+      protocol: TCP
+      port: 6379
+      targetPort: 6379
+    - name: sentinel
+      protocol: TCP
+      port: 26379
+      targetPort: 26379
+  selector:
+    statefulset.kubernetes.io/pod-name: redis-sentinel-server-1
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-sentinel-announce-2
+  labels:
+    dce.daocloud.io/app: redis-sentinel
+spec:
+  type: ClusterIP
+  publishNotReadyAddresses: true
+  ports:
+    - name: redis
+      protocol: TCP
+      port: 6379
+      targetPort: 6379
+    - name: sentinel
+      protocol: TCP
+      port: 26379
+      targetPort: 26379
+  selector:
+    statefulset.kubernetes.io/pod-name: redis-sentinel-server-2
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  labels:
+    dce.daocloud.io/app: redis-sentinel
+    dce.daocloud.io/component: redis-sentinel
+  name: redis-sentinel-server
+spec:
+  podManagementPolicy: OrderedReady
+  replicas: 3
+  selector:
+    matchLabels:
+      dce.daocloud.io/app: redis-sentinel
+      dce.daocloud.io/component: redis-sentinel
+  serviceName: redis-sentinel
+  template:
+    metadata:
+      labels:
+        dce.daocloud.io/app: redis-sentinel
+        dce.daocloud.io/component: redis-sentinel
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                dce.daocloud.io/component: redis-sentinel
+            topologyKey: kubernetes.io/hostname
+      initContainers:
+      - name: config-init
+        image: redis:5.0.14
+        imagePullPolicy: IfNotPresent
+        command:
+        - sh
+        args:
+        - /tmp/init.sh
+        env:
+        - name: SENTINEL_ID_0
+          value: f36e7b8f185794ad3fa3c6bd65f726d83353b104
+        - name: SENTINEL_ID_1
+          value: cb5ae69e716285391335bc1b978769cfa9cbd344
+        - name: SENTINEL_ID_2
+          value: 38fc7d01b8bf1fcfd43b8b9411d918bd95f2f72b
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        envFrom:
+        - configMapRef:
+            name: redis-sentinel-env
+        - secretRef:
+            name: redis-sentinel-pass
+        resources:
+          limits:
+            cpu: 50m
+            memory: 64Mi
+          requests:
+            cpu: 50m
+            memory: 64Mi
+        volumeMounts:
+        - mountPath: /tmp
+          name: config
+          readOnly: true
+        - mountPath: /data
+          name: pvc
+      containers:
+      - name: redis
+        image: redis:5.0.14
+        imagePullPolicy: IfNotPresent
+        command:
+        - redis-server
+        args:
+        - /data/conf/redis.conf
+        envFrom:
+        - configMapRef:
+            name: redis-sentinel-env
+        ports:
+        - containerPort: 6379
+          name: redis
+          protocol: TCP
+        resources:
+          limits:
+            cpu: 1000m
+            memory: 2048Mi
+          requests:
+            cpu: 250m
+            memory: 2048Mi
+        volumeMounts:
+        - mountPath: /data
+          name: pvc
+        livenessProbe:
+          failureThreshold: 3
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          successThreshold: 1
+          tcpSocket:
+            port: 6379
+          timeoutSeconds: 1
+      - name: sentinel
+        image: redis:5.0.14
+        imagePullPolicy: IfNotPresent
+        command:
+        - redis-sentinel
+        args:
+        - /data/conf/sentinel.conf
+        envFrom:
+        - configMapRef:
+            name: redis-sentinel-env
+        ports:
+        - containerPort: 26379
+          name: sentinel
+          protocol: TCP
+        resources:
+          limits:
+            cpu: 800m
+            memory: 1024Mi
+          requests:
+            cpu: 200m
+            memory: 1024Mi
+        volumeMounts:
+        - mountPath: /data
+          name: pvc
+        livenessProbe:
+          failureThreshold: 3
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          successThreshold: 1
+          tcpSocket:
+            port: 26379
+          timeoutSeconds: 1
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      securityContext:
+        fsGroup: 1000
+        runAsNonRoot: true
+        runAsUser: 1000
+      tolerations:
+      - effect: NoSchedule
+        key: node-role.kubernetes.io/master
+      - key: CriticalAddonsOnly
+        operator: Exists
+      volumes:
+      - configMap:
+          defaultMode: 420
+          name: redis-sentinel
+        name: config
+  updateStrategy:
+    type: RollingUpdate
+  volumeClaimTemplates:
+  - apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      name: pvc
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 5Gi
+      volumeMode: Filesystem
+      storageClassName: huawei-nas-v3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-sentinel-lb
+spec:
+  type: ClusterIP
+  ports:
+    - name: redis
+      protocol: TCP
+      port: 6379
+      targetPort: 6379
+    - name: sentinel
+      protocol: TCP
+      port: 26379
+      targetPort: 26379
+  selector:
+    dce.daocloud.io/app: redis-sentinel

@@ -1,0 +1,120 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-standalone-cm
+  labels:
+    app: redis-standalone
+    dce.daocloud.io/app: redis-standalone
+data:
+  redis.conf: |
+    dir /data
+    port 6379
+    bind 0.0.0.0
+    appendonly yes
+    protected-mode no
+    requirepass oiYrtYlnqi
+    pidfile /data/redis-6379.pid
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  annotations:
+    dce.daocloud.io/app: redis-standalone
+  name: redis-standalone-data
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: huawei-nas-v3
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-standalone
+  labels:
+    name: redis-standalone
+    dce.daocloud.io/app: redis-standalone
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: redis-standalone
+  #设置滚动更新策略
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        name: redis-standalone
+        dce.daocloud.io/app: redis-standalone
+    spec:
+      containers:
+      - name: redis-standalone
+        image: 10.82.36.43/library/redis:5.0.14
+        imagePullPolicy: IfNotPresent
+        command:
+          - "sh"
+          - "-c"
+          - "redis-server /usr/local/etc/redis.conf"
+        #容器资源限制
+        resources:
+          limits:
+            memory: 1Gi
+            cpu: 1000m
+          requests:
+            memory: 1Gi
+            cpu: 250m
+        #容器存活健康检测
+        livenessProbe:
+          tcpSocket:
+            port: 6379
+          initialDelaySeconds: 20
+          periodSeconds: 5
+          failureThreshold: 3
+        #容器就绪健康检测
+        readinessProbe:
+          tcpSocket:
+            port: 6379
+          initialDelaySeconds: 20
+          periodSeconds: 5
+          failureThreshold: 3
+        #容器路径挂载
+        volumeMounts:
+        - mountPath: /data
+          name: redis-standalone-data
+        - mountPath: /usr/local/etc/redis.conf
+          name: redis-standalone-config
+          subPath: redis.conf
+        #设置容器端口
+        ports:
+        - containerPort: 6379
+          protocol: TCP
+          name: http
+      #设置挂载点，第一个为pvc挂载。第二个为configmap资源对象挂载
+      volumes:
+      - name: redis-standalone-data
+        persistentVolumeClaim:
+          claimName: redis-standalone-data
+      - name: redis-standalone-config
+        configMap:
+          name: redis-standalone-cm
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-standalone-svc
+  labels:
+    name: redis-standalone
+    dce.daocloud.io/app: redis-standalone
+spec:
+  selector:
+    name: redis-standalone
+  type: NodePort
+  ports:
+    - port: 6379
+      targetPort: 6379
