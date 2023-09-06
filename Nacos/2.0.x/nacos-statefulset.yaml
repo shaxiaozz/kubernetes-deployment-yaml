@@ -1,0 +1,180 @@
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: nacos-cm
+  labels:
+    name: nacos
+data:
+  mysql.db.name: nacos_config
+  mysql.password: FkqaBtpVDNqlpnp
+  mysql.port: "3306"
+  mysql.service.host: nacos-mysql
+  mysql.user: nacos
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: nacos
+  labels:
+    version: 2.0.3
+    name: nacos
+spec:
+  serviceName: nacos-headless
+  podManagementPolicy: Parallel
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        version: 2.0.3
+        name: nacos
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: "name"
+                    operator: In
+                    values:
+                      - nacos
+              topologyKey: "kubernetes.io/hostname"
+      containers:
+        - name: nacos
+          imagePullPolicy: IfNotPresent
+          image: nacos/nacos-server:2.0.3
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "500m"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+          livenessProbe:
+            httpGet:
+              path: /nacos
+              port: 8848
+              scheme: HTTP
+            initialDelaySeconds: 80
+            timeoutSeconds: 1
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /nacos
+              port: 8848
+              scheme: HTTP
+            initialDelaySeconds: 80
+            timeoutSeconds: 1
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+          ports:
+            - containerPort: 8848
+              name: client
+            - containerPort: 9848
+              name: client-rpc
+            - containerPort: 9849
+              name: raft-rpc
+            - containerPort: 7848
+              name: old-raft-rpc
+          env:
+            - name: MY_POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: NACOS_REPLICAS
+              value: "3"
+            - name: MYSQL_SERVICE_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: nacos-cm
+                  key: mysql.service.host
+            - name: MYSQL_SERVICE_DB_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: nacos-cm
+                  key: mysql.db.name
+            - name: MYSQL_SERVICE_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: nacos-cm
+                  key: mysql.port
+            - name: MYSQL_SERVICE_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: nacos-cm
+                  key: mysql.user
+            - name: MYSQL_SERVICE_PASSWORD
+              valueFrom:
+                configMapKeyRef:
+                  name: nacos-cm
+                  key: mysql.password
+            - name: NACOS_SERVER_PORT
+              value: "8848"
+            - name: NACOS_APPLICATION_PORT
+              value: "8848"
+            - name: PREFER_HOST_MODE
+              value: "hostname"
+            - name: NACOS_SERVERS
+              value: "nacos-0.nacos-headless:8848 nacos-1.nacos-headless:8848 nacos-2.nacos-headless:8848"
+  selector:
+    matchLabels:
+      version: 2.0.3
+      name: nacos
+---
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    service.alpha.kubernetes.io/tolerate-unready-endpoints: "true"
+  labels:
+    version: 2.0.3
+    name: nacos
+  name: nacos-headless
+spec:
+  clusterIP: None
+  ipFamily: IPv4
+  ports:
+    - name: server
+      port: 8848
+      protocol: TCP
+      targetPort: 8848
+    - name: client-rpc
+      port: 9848
+      protocol: TCP
+      targetPort: 9848
+    - name: raft-rpc
+      port: 9849
+      protocol: TCP
+      targetPort: 9849
+    - name: old-raft-rpc
+      port: 7848
+      protocol: TCP
+      targetPort: 7848
+  selector:
+    version: 2.0.3
+  sessionAffinity: None
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    io.daocloud.dce.serviceSelectorType: service
+  labels:
+    name: nacos
+  name: nacos
+spec:
+  externalTrafficPolicy: Cluster
+  ipFamily: IPv4
+  ports:
+    - name: nacos-8848
+      port: 8848
+      protocol: TCP
+      targetPort: 8848
+  selector:
+    version: 2.0.3
+    name: nacos
+  sessionAffinity: None
+  type: NodePort
